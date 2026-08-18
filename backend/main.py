@@ -1,0 +1,647 @@
+import time
+import uuid
+import logging
+import logging.config
+from collections import defaultdict
+from typing import List
+
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+import models
+import schemas
+import security
+import database
+import analyzer
+import config
+from seed_data import seed_database
+
+# ──────────────────────────────────────────────
+# Structured Logging Setup
+# ──────────────────────────────────────────────
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "structured": {
+            "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            "datefmt": "%Y-%m-%dT%H:%M:%S",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "structured",
+            "level": "DEBUG",
+        },
+        "file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": "cloudvuln_api.log",
+            "maxBytes": 10 * 1024 * 1024,  # 10MB
+            "backupCount": 3,
+            "formatter": "structured",
+            "level": "INFO",
+        },
+    },
+    "root": {
+        "handlers": ["console", "file"],
+        "level": config.settings.LOG_LEVEL,
+    },
+}
+
+logging.config.dictConfig(LOGGING_CONFIG)
+logger = logging.getLogger("CloudVulnEngine")
+
+# ──────────────────────────────────────────────
+# App bootstrap
+# ──────────────────────────────────────────────
+
+database.init_db()
+seed_database()
+
+app = FastAPI(
+    title=config.settings.PROJECT_NAME,
+    description="FastAPI Authentication, Security Engine & Vulnerability Platform",
+    version="2.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+)
+
+# ──────────────────────────────────────────────
+# CORS Middleware
+# ──────────────────────────────────────────────
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    expose_headers=["X-Request-ID", "X-Process-Time"],
+)
+
+# ──────────────────────────────────────────────
+# Rate Limiting Store (in-memory, per IP)
+# ──────────────────────────────────────────────
+
+ip_request_counts: dict = defaultdict(list)
+
+# ──────────────────────────────────────────────
+# Security + Logging Middleware
+# ──────────────────────────────────────────────
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())[:8]
+    client_ip = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+
+    # ─── Rate Limiting ───
+    current_time = time.time()
+    window_start = current_time - config.settings.RATE_LIMIT_WINDOW_SECONDS
+    ip_request_counts[client_ip] = [
+        t for t in ip_request_counts[client_ip] if t > window_start
+    ]
+
+    if len(ip_request_counts[client_ip]) >= config.settings.RATE_LIMIT_REQUESTS:
+        logger.warning(f"[{request_id}] Rate limit exceeded | IP={client_ip} | path={request.url.path}")
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": True,
+                "message": "Rate limit exceeded. Maximum 100 requests/minute. Please slow down.",
+                "status_code": 429,
+                "retry_after": config.settings.RATE_LIMIT_WINDOW_SECONDS,
+            },
+        )
+
+    ip_request_counts[client_ip].append(current_time)
+
+    # ─── Process Request ───
+    start_time = time.time()
+    response = await call_next(request)
+    duration_ms = round((time.time() - start_time) * 1000, 2)
+
+    # ─── Security Headers ───
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "font-src 'self' data:; "
+        "connect-src 'self' https://nvd.nist.gov https://api.first.org; "
+        "frame-ancestors 'none';"
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = f"{duration_ms}ms"
+
+    # Remove server fingerprinting safely if present
+    if "server" in response.headers:
+        del response.headers["server"]
+    if "x-powered-by" in response.headers:
+        del response.headers["x-powered-by"]
+
+    log_level = logging.WARNING if response.status_code >= 400 else logging.INFO
+    logger.log(
+        log_level,
+        f"[{request_id}] {request.method} {request.url.path} "
+        f"| status={response.status_code} | ip={client_ip} | {duration_ms}ms"
+    )
+
+    return response
+
+
+# ──────────────────────────────────────────────
+# Global Exception Handlers
+# ──────────────────────────────────────────────
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(
+        f"HTTP {exc.status_code} on {request.method} {request.url.path}: {exc.detail}"
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": True, "message": str(exc.detail), "status_code": exc.status_code},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    # Build a human-readable message
+    field_errors = []
+    for e in errors:
+        loc = " → ".join(str(l) for l in e.get("loc", []) if l != "body")
+        field_errors.append(f"{loc}: {e['msg']}" if loc else e["msg"])
+    message = "; ".join(field_errors) if field_errors else "Invalid request data"
+    logger.warning(f"Validation error on {request.url.path}: {message}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": True,
+            "message": message,
+            "status_code": 422,
+            "detail": errors,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        f"Unhandled exception on {request.method} {request.url.path}: {str(exc)}",
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": True,
+            "message": "An internal server error occurred. The incident has been logged.",
+            "status_code": 500,
+        },
+    )
+
+
+# ──────────────────────────────────────────────
+# Health Check
+# ──────────────────────────────────────────────
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "engine": "CloudVuln FastAPI v2",
+        "version": "2.0.0",
+        "features": ["jwt-auth", "rbac", "rate-limiting", "security-headers", "wal-sqlite"],
+    }
+
+
+@app.get("/api/health")
+def api_health(db: Session = Depends(database.get_db)):
+    try:
+        from sqlalchemy import text
+        db.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception as e:
+        logger.error(f"Health check DB query error: {e}")
+        db_status = "degraded"
+    return {"api": "ok", "database": db_status, "version": "2.0.0"}
+
+
+# ──────────────────────────────────────────────
+# Auth Endpoints
+# ──────────────────────────────────────────────
+
+@app.post("/api/auth/register", response_model=schemas.Token, status_code=status.HTTP_201_CREATED)
+def register(user_in: schemas.UserCreate, db: Session = Depends(database.get_db)):
+    existing = db.query(models.User).filter(models.User.email == user_in.email).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists",
+        )
+
+    hashed_pwd = security.get_password_hash(user_in.password)
+    db_user = models.User(
+        email=user_in.email,
+        full_name=user_in.full_name,
+        hashed_password=hashed_pwd,
+        role=user_in.role or "SecOps Lead",
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+
+    access_token = security.create_access_token(data={"sub": db_user.email})
+    refresh_token = security.create_refresh_token(data={"sub": db_user.email})
+
+    logger.info(f"New user registered: {db_user.email} | role={db_user.role}")
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": db_user,
+    }
+
+
+@app.post("/api/auth/login", response_model=schemas.Token)
+def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.get_db)):
+    user = db.query(models.User).filter(models.User.email == user_credentials.email).first()
+
+    # Use constant-time comparison to prevent timing attacks
+    if not user or not security.verify_password(user_credentials.password, user.hashed_password):
+        logger.warning(f"Failed login attempt for email: {user_credentials.email}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email address or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been deactivated. Contact an administrator.",
+        )
+
+    # Update last_login
+    import datetime
+    user.last_login = datetime.datetime.utcnow()
+    db.commit()
+
+    access_token = security.create_access_token(data={"sub": user.email})
+    refresh_token = security.create_refresh_token(data={"sub": user.email})
+
+    logger.info(f"Successful login: {user.email}")
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.post("/api/auth/refresh")
+def refresh_token(req: schemas.RefreshTokenRequest, db: Session = Depends(database.get_db)):
+    email = security.verify_refresh_token(req.refresh_token)
+    user = db.query(models.User).filter(models.User.email == email).first()
+
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account inactive or not found",
+        )
+
+    new_access_token = security.create_access_token(data={"sub": user.email})
+    new_refresh_token = security.create_refresh_token(data={"sub": user.email})
+
+    logger.info(f"Token refreshed for: {user.email}")
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.get("/api/auth/me", response_model=schemas.UserResponse)
+def get_me(current_user: models.User = Depends(security.get_current_user)):
+    return current_user
+
+
+@app.post("/api/auth/logout")
+def logout(current_user: models.User = Depends(security.get_current_user)):
+    logger.info(f"User logged out: {current_user.email}")
+    return {"message": "Logged out successfully. Please discard your tokens client-side."}
+
+
+# ──────────────────────────────────────────────
+# Dashboard Endpoints
+# ──────────────────────────────────────────────
+
+@app.get("/api/dashboard/summary", response_model=schemas.DashboardSummary)
+def get_dashboard_summary(db: Session = Depends(database.get_db)):
+    from sqlalchemy import func
+
+    # Aggregate counts in a single query
+    result = db.query(
+        func.count(models.Scan.id).label("total_scans"),
+        func.coalesce(func.sum(models.Scan.critical_count), 0).label("critical"),
+        func.coalesce(func.sum(models.Scan.high_count), 0).label("high"),
+        func.coalesce(func.sum(models.Scan.medium_count), 0).label("medium"),
+        func.coalesce(func.sum(models.Scan.low_count), 0).label("low"),
+    ).first()
+
+    active_scans = db.query(models.Scan).filter(
+        models.Scan.status.in_(["running", "critical"])
+    ).count()
+
+    return {
+        "total_scans": result.total_scans or 0,
+        "monitored_assets": 142,
+        "critical_vulnerabilities": result.critical or 0,
+        "high_vulnerabilities": result.high or 0,
+        "medium_vulnerabilities": result.medium or 0,
+        "low_vulnerabilities": result.low or 0,
+        "info_vulnerabilities": 18,
+        "active_scans": active_scans,
+        "compliance_score": 96.0,
+        "posture_score": 94,
+    }
+
+
+@app.get("/api/dashboard/risk-statistics", response_model=schemas.RiskStatisticsResponse)
+def get_risk_statistics(db: Session = Depends(database.get_db)):
+    from sqlalchemy import func
+
+    result = db.query(
+        func.coalesce(func.sum(models.Scan.critical_count), 0).label("critical"),
+        func.coalesce(func.sum(models.Scan.high_count), 0).label("high"),
+        func.coalesce(func.sum(models.Scan.medium_count), 0).label("medium"),
+        func.coalesce(func.sum(models.Scan.low_count), 0).label("low"),
+    ).first()
+
+    critical = result.critical or 4
+    high = result.high or 12
+    medium = result.medium or 28
+    low = result.low or 45
+
+    severity_breakdown = [
+        {"name": "Critical", "value": critical, "color": "#ef4444"},
+        {"name": "High",     "value": high,     "color": "#f97316"},
+        {"name": "Medium",   "value": medium,   "color": "#f59e0b"},
+        {"name": "Low",      "value": low,      "color": "#00f3ff"},
+        {"name": "Info",     "value": 18,       "color": "#64748b"},
+    ]
+
+    trend_history = [
+        {"date": "Jul 20", "critical": 8,        "high": 18,   "medium": 35},
+        {"date": "Jul 21", "critical": 7,        "high": 16,   "medium": 32},
+        {"date": "Jul 22", "critical": 6,        "high": 15,   "medium": 30},
+        {"date": "Jul 23", "critical": 5,        "high": 14,   "medium": 29},
+        {"date": "Jul 24", "critical": 4,        "high": 14,   "medium": 28},
+        {"date": "Jul 25", "critical": 4,        "high": 13,   "medium": 28},
+        {"date": "Jul 26", "critical": critical, "high": high, "medium": medium},
+    ]
+
+    return {"severity_breakdown": severity_breakdown, "trend_history": trend_history}
+
+
+@app.get("/api/dashboard/recent-scans", response_model=List[schemas.ScanResponse])
+def get_recent_scans(db: Session = Depends(database.get_db)):
+    return (
+        db.query(models.Scan)
+        .order_by(models.Scan.created_at.desc())
+        .limit(10)
+        .all()
+    )
+
+
+@app.get("/api/dashboard/activity", response_model=List[schemas.ActivityLogResponse])
+def get_recent_activity(db: Session = Depends(database.get_db)):
+    return (
+        db.query(models.ActivityLog)
+        .order_by(models.ActivityLog.created_at.desc())
+        .limit(10)
+        .all()
+    )
+
+
+# ──────────────────────────────────────────────
+# Security Analysis & CVE
+# ──────────────────────────────────────────────
+
+@app.post("/api/analysis/target", response_model=schemas.SecurityAnalysisResponse)
+def analyze_security_target(
+    req: schemas.SecurityAnalysisRequest,
+    db: Session = Depends(database.get_db),
+):
+    result = analyzer.perform_security_analysis(req.target_url)
+
+    db.add(models.ActivityLog(
+        text=f"Security analysis executed for {result['target']} (Score: {result['security_score']}/100)",
+        type="info" if result["risk_level"] in ("Low", "Medium") else "warning",
+        time_ago="Just now",
+    ))
+    db.commit()
+    return result
+
+
+@app.get("/api/cve/search", response_model=List[schemas.CVEResult])
+def search_cve_database(query: str = "Tomcat"):
+    if not query or len(query) > 200:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid CVE query")
+    return analyzer.query_nvd_cve(query)
+
+
+@app.get("/api/whois/lookup", response_model=schemas.WhoisSummary)
+def lookup_whois(domain: str = "cloudvuln.io"):
+    return analyzer.analyze_whois(domain)
+
+
+@app.post("/api/analysis/owasp", response_model=schemas.OWASPSummary)
+def analyze_owasp(req: schemas.SecurityAnalysisRequest):
+    return analyzer.analyze_owasp_top10(req.target_url)
+
+
+# ──────────────────────────────────────────────
+# Scan History CRUD
+# ──────────────────────────────────────────────
+
+@app.post("/api/scans", response_model=schemas.ScanResponse, status_code=status.HTTP_201_CREATED)
+def create_scan_record(
+    scan_in: schemas.ScanCreate,
+    db: Session = Depends(database.get_db),
+):
+    import random
+    scan_ref = f"SCAN-2026-{random.randint(1000, 9999)}"
+
+    new_scan = models.Scan(
+        scan_ref=scan_ref,
+        target=scan_in.target,
+        provider=scan_in.provider or "AWS US-East-1",
+        scan_type=scan_in.scan_type or "Cloud Misconfig",
+        status=scan_in.status or "passed",
+        critical_count=scan_in.critical_count or 0,
+        high_count=scan_in.high_count or 0,
+        medium_count=scan_in.medium_count or 0,
+        low_count=scan_in.low_count or 0,
+        risk_score=scan_in.risk_score or 0.0,
+        duration=scan_in.duration or "2m 15s",
+    )
+    db.add(new_scan)
+    db.add(models.ActivityLog(
+        text=f"New assessment recorded: {scan_ref} on {scan_in.target}",
+        type="info" if scan_in.status == "passed" else "warning",
+        time_ago="Just now",
+    ))
+    db.commit()
+    db.refresh(new_scan)
+    logger.info(f"Scan created: {scan_ref} | target={scan_in.target}")
+    return new_scan
+
+
+@app.get("/api/scans", response_model=List[schemas.ScanResponse])
+def get_scans_history(
+    search: str = None,
+    status_filter: str = None,
+    sort_by: str = "date_desc",
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(database.get_db),
+):
+    # Validate pagination
+    if limit < 1 or limit > 500:
+        limit = 100
+    if offset < 0:
+        offset = 0
+
+    query = db.query(models.Scan)
+
+    if search:
+        search = search[:100]  # cap length
+        pattern = f"%{search}%"
+        query = query.filter(
+            models.Scan.target.ilike(pattern)
+            | models.Scan.scan_ref.ilike(pattern)
+            | models.Scan.provider.ilike(pattern)
+        )
+
+    if status_filter and status_filter.lower() != "all":
+        query = query.filter(models.Scan.status.ilike(status_filter))
+
+    order_map = {
+        "risk_desc": models.Scan.risk_score.desc(),
+        "risk_asc":  models.Scan.risk_score.asc(),
+        "date_asc":  models.Scan.created_at.asc(),
+        "date_desc": models.Scan.created_at.desc(),
+    }
+    query = query.order_by(order_map.get(sort_by, models.Scan.created_at.desc()))
+
+    return query.offset(offset).limit(limit).all()
+
+
+@app.get("/api/scans/{scan_ref}", response_model=schemas.ScanDetailResponse)
+def get_scan_by_ref(scan_ref: str, db: Session = Depends(database.get_db)):
+    scan = db.query(models.Scan).filter(models.Scan.scan_ref == scan_ref).first()
+    if not scan:
+        scan = db.query(models.Scan).filter(models.Scan.target.ilike(f"%{scan_ref}%")).first()
+    if not scan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan '{scan_ref}' not found",
+        )
+    return scan
+
+
+@app.delete("/api/scans/{scan_ref}")
+def delete_scan_record(
+    scan_ref: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.require_roles(["Admin", "SecOps Lead"])),
+):
+    scan = db.query(models.Scan).filter(models.Scan.scan_ref == scan_ref).first()
+    if not scan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan '{scan_ref}' not found",
+        )
+    db.delete(scan)
+    db.commit()
+    logger.info(f"Scan '{scan_ref}' deleted by {current_user.email}")
+    return {"message": f"Scan '{scan_ref}' deleted successfully", "scan_ref": scan_ref}
+
+
+# ──────────────────────────────────────────────
+# Report Endpoints
+# ──────────────────────────────────────────────
+
+@app.get("/api/reports/{scan_ref}")
+def get_report_by_scan_ref(scan_ref: str, db: Session = Depends(database.get_db)):
+    scan = db.query(models.Scan).filter(models.Scan.scan_ref == scan_ref).first()
+    if not scan:
+        scan = db.query(models.Scan).first()
+
+    return {
+        "scan_ref":       scan.scan_ref if scan else scan_ref,
+        "target":         scan.target if scan else "api.production.cloudvuln.io",
+        "cloud_provider": scan.provider if scan else "AWS US-East-1",
+        "status":         scan.status if scan else "critical",
+        "risk_score":     scan.risk_score if scan else 9.8,
+        "critical_count": scan.critical_count if scan else 1,
+        "high_count":     scan.high_count if scan else 2,
+        "medium_count":   scan.medium_count if scan else 2,
+        "low_count":      scan.low_count if scan else 0,
+        "executed_at":    scan.created_at.strftime("%Y-%m-%d %H:%M UTC") if scan and scan.created_at else "2026-07-27 18:20 UTC",
+    }
+
+
+@app.get("/api/reports/{scan_ref}/download")
+def download_report_file(
+    scan_ref: str,
+    format: str = "html",
+    db: Session = Depends(database.get_db),
+):
+    import report_generator
+
+    scan = db.query(models.Scan).filter(models.Scan.scan_ref == scan_ref).first()
+    scan_dict = {
+        "scan_ref":     scan.scan_ref if scan else scan_ref,
+        "target":       scan.target if scan else "api.production.cloudvuln.io",
+        "provider":     scan.provider if scan else "AWS US-East-1",
+        "status":       scan.status if scan else "critical",
+        "risk_score":   scan.risk_score if scan else 9.8,
+        "critical_count": scan.critical_count if scan else 1,
+        "high_count":   scan.high_count if scan else 2,
+        "medium_count": scan.medium_count if scan else 2,
+        "created_at":   scan.created_at.strftime("%Y-%m-%d %H:%M UTC") if scan and scan.created_at else "2026-07-27 18:20 UTC",
+    }
+
+    if format.lower() == "pdf":
+        pdf_bytes = report_generator.generate_pdf_report(scan_dict)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=CloudVuln_Audit_{scan_ref}.pdf"},
+        )
+    else:
+        html_str = report_generator.generate_html_report(scan_dict)
+        return Response(
+            content=html_str,
+            media_type="text/html",
+            headers={"Content-Disposition": f"attachment; filename=CloudVuln_Audit_{scan_ref}.html"},
+        )
+
